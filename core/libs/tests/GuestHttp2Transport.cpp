@@ -1862,12 +1862,24 @@ void FirstNetworkRequest(int ssl) {
 }
 #endif
 
+void ExpectAsyncSendFailure(const Client& client, int expected) {
+    Require(sceHttp2SendRequestAsync(client.request, nullptr, 0, nullptr, nullptr) == 0, "async failure submission");
+    Http2AsyncResult result{};
+    Require(sceHttp2WaitAsync(client.request, &result, nullptr, nullptr) == 0, "async failure completion");
+    Require(result.req_id == client.request && result.event_type == 0 && result.result == expected, "async send publishes the transport error");
+    AfterFailedSend(client, expected);
+}
+
 void HostNotFound(int ssl) {
     Client client(ssl);
     client.Create("https://nonexistent.invalid/");
     Require(sceHttp2SendRequest(client.request, nullptr, 0) == static_cast<int>(0x804101E6),
             "lookup failure maps to console DNS error");
     AfterFailedSend(client, static_cast<int>(0x804101E6));
+
+    Client asyncClient(ssl);
+    asyncClient.Create("https://nonexistent.invalid/");
+    ExpectAsyncSendFailure(asyncClient, static_cast<int>(0x804101E6));
 }
 
 void Refused(int ssl) {
@@ -1887,6 +1899,22 @@ void Refused(int ssl) {
     client.Create(url);
     Require(sceHttp2SendRequest(client.request, nullptr, 0) == static_cast<int>(0x8041013d), "raw connection refused error");
     AfterFailedSend(client, static_cast<int>(0x8041013d));
+
+    Client asyncClient(ssl);
+    asyncClient.Create(url);
+    ExpectAsyncSendFailure(asyncClient, static_cast<int>(0x8041013D));
+}
+
+void AsyncOverallDeadline(int ssl) {
+    Server server(Mode::StallHeaders);
+    Client client(ssl);
+    client.Create(server.Url());
+    Require(sceHttp2SetTimeOut(client.request, 100000) == 0, "async overall deadline");
+    const auto begin = std::chrono::steady_clock::now();
+    ExpectAsyncSendFailure(client, static_cast<int>(0x817B1068));
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    Require(elapsed >= std::chrono::milliseconds(80) && elapsed < std::chrono::seconds(2), "bounded async overall deadline");
+    server.Join();
 }
 
 std::atomic<int> lookups{0};
@@ -2196,6 +2224,7 @@ int main(int argc, char** argv) {
         }
         HostNotFound(ssl);
         Refused(ssl);
+        AsyncOverallDeadline(ssl);
         Capacity(ssl);
         Retries(ssl);
         Async(ssl);
